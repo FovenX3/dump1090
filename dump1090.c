@@ -10,7 +10,7 @@
 #define CENTER_FREQ 315020000
 #define SAMPLE_RATE 1000000
 #define CHUNK_SIZE 200000  // 每次读取 0.2 秒
-#define SNAPSHOT_CHUNKS 5  // 快照总长度: 1个前置 + 1个触发 + 3个后置 = 1秒
+#define SNAPSHOT_CHUNKS 5  // 快照总长度: 1个前置(历史) + 1个触发 + 3个后置 = 1秒
 
 int stop = 0;
 
@@ -25,7 +25,7 @@ typedef struct {
     int duration;
 } Pulse;
 
-// 简单的二进制转十六进制打印
+// 二进制转十六进制打印
 void print_hex(const char *bits, int len) {
     printf(" 🔑 滚动码 (Hex) : ");
     int byte_val = 0;
@@ -47,7 +47,7 @@ void print_hex(const char *bits, int len) {
     printf("\n");
 }
 
-// 核心离线解码函数
+// 核心离线解码函数：全量元数据 + 指纹锚定
 void analyze_packet(int16_t *i_data, int16_t *q_data, int total_samples, double i_leak, double q_leak) {
     int decimation = 5;
     int dec_len = total_samples / decimation;
@@ -130,15 +130,12 @@ void analyze_packet(int16_t *i_data, int16_t *q_data, int total_samples, double 
     printf("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n");
 
     // ========================================================
-    // 新增：强制输出所有接收到的底层脉宽元数据
+    // 强制输出所有接收到的底层脉宽元数据
     // ========================================================
     printf(" 📊 【底层脉宽元数据 (Raw Data)】:\n   ");
     for (int i = 0; i < clean_cnt; i++) {
         printf("%c%d ", clean_pulses[i].state, clean_pulses[i].duration);
-        // 每 8 个脉冲换行，保持队形整齐
-        if ((i + 1) % 8 == 0) {
-            printf("\n   ");
-        }
+        if ((i + 1) % 8 == 0) printf("\n   ");
     }
     printf("\n----------------------------------------------------------\n");
 
@@ -164,7 +161,6 @@ void analyze_packet(int16_t *i_data, int16_t *q_data, int total_samples, double 
                     sync_idx = i + 1;
                     break;
                 }
-                // 否则重新计数
                 streak = 0;
             }
         }
@@ -270,61 +266,106 @@ int main(void) {
         double m = sqrt(di*di + dq*dq);
         if (m > max_noise) max_noise = m;
     }
-    double trigger_level = max_noise * 3.5;
+    double trigger_level = max_noise * 4.0;
 
     printf("✅ 校准完成! 泄漏向量 I:%.1f Q:%.1f | 触发门限: %.1f\n", i_leak, q_leak, trigger_level);
     printf(">>> 🚀 触发式快照雷达已启动！请随时按下车钥匙... (按 Ctrl+C 退出) <<<\n");
 
+    // 分配快照内存
     int total_snap_samples = CHUNK_SIZE * SNAPSHOT_CHUNKS;
     int16_t *snap_i = (int16_t *)malloc(total_snap_samples * sizeof(int16_t));
     int16_t *snap_q = (int16_t *)malloc(total_snap_samples * sizeof(int16_t));
+
+    // 分配“过去 0.2 秒”缓存
+    int16_t *prev_i = (int16_t *)malloc(CHUNK_SIZE * sizeof(int16_t));
+    int16_t *prev_q = (int16_t *)malloc(CHUNK_SIZE * sizeof(int16_t));
+    memset(prev_i, 0, CHUNK_SIZE * sizeof(int16_t));
+    memset(prev_q, 0, CHUNK_SIZE * sizeof(int16_t));
 
     while (!stop) {
         iio_buffer_refill(rxbuf);
         
         int triggered = 0;
-        int check_cnt = 0;
+        int trigger_idx = -1;
+        int high_cnt = 0;
+        int idx = 0;
+
+        // 全量扫描当前块寻找爆发点
         p_dat = iio_buffer_first(rxbuf, rx0_i);
-        for (; p_dat < p_end && check_cnt < 5000; p_dat += p_inc, check_cnt++) {
+        for (; p_dat < p_end; p_dat += p_inc, idx++) {
             double di = ((int16_t*)p_dat)[0] - i_leak;
             double dq = ((int16_t*)p_dat)[1] - q_leak;
+            
             if (sqrt(di*di + dq*dq) > trigger_level) {
-                triggered = 1;
-                break;
+                high_cnt++;
+                // 连续 5 点超出门限才触发，过滤静电毛刺
+                if (high_cnt > 5) {
+                    triggered = 1;
+                    trigger_idx = idx;
+                    break;
+                }
+            } else {
+                high_cnt = 0;
             }
         }
 
         if (triggered) {
-            printf("\n⚡ 检测到射频爆发！正在锁定快门...\n");
+            printf("\n⚡ 检测到射频爆发！锁定在位置 %d / %d...\n", trigger_idx, CHUNK_SIZE);
             int offset = 0;
             
+            // 1. 拼接历史缓存
+            memcpy(&snap_i[offset], prev_i, CHUNK_SIZE * sizeof(int16_t));
+            memcpy(&snap_q[offset], prev_q, CHUNK_SIZE * sizeof(int16_t));
+            offset += CHUNK_SIZE;
+
+            // 2. 拼接当前触发块
+            idx = 0;
             p_dat = iio_buffer_first(rxbuf, rx0_i);
-            for (; p_dat < p_end; p_dat += p_inc) {
-                snap_i[offset] = ((int16_t*)p_dat)[0];
-                snap_q[offset] = ((int16_t*)p_dat)[1];
-                offset++;
+            for (; p_dat < p_end; p_dat += p_inc, idx++) {
+                snap_i[offset + idx] = ((int16_t*)p_dat)[0];
+                snap_q[offset + idx] = ((int16_t*)p_dat)[1];
             }
+            offset += CHUNK_SIZE;
 
-            for (int chunk = 1; chunk < SNAPSHOT_CHUNKS; chunk++) {
+            // 3. 抓取未来 3 个块
+            for (int chunk = 2; chunk < SNAPSHOT_CHUNKS; chunk++) {
                 iio_buffer_refill(rxbuf);
+                idx = 0;
                 p_dat = iio_buffer_first(rxbuf, rx0_i);
-                for (; p_dat < p_end; p_dat += p_inc) {
-                    snap_i[offset] = ((int16_t*)p_dat)[0];
-                    snap_q[offset] = ((int16_t*)p_dat)[1];
-                    offset++;
+                for (; p_dat < p_end; p_dat += p_inc, idx++) {
+                    snap_i[offset + idx] = ((int16_t*)p_dat)[0];
+                    snap_q[offset + idx] = ((int16_t*)p_dat)[1];
                 }
+                offset += CHUNK_SIZE;
             }
 
+            printf("⚙️ 完整快照已生成，正在离线高精度解码...\n");
             analyze_packet(snap_i, snap_q, total_snap_samples, i_leak, q_leak);
             
-            // 清理堆积在底层的硬件缓存，防止连续触发
+            // 清理积压缓存
             for (int k=0; k<3; k++) iio_buffer_refill(rxbuf);
+            
+            // 触发完毕，清空历史数据，防止连续重触发
+            memset(prev_i, 0, CHUNK_SIZE * sizeof(int16_t));
+            memset(prev_q, 0, CHUNK_SIZE * sizeof(int16_t));
+            
             printf(">>> 继续监听... <<<\n");
+            
+        } else {
+            // 如果很安静，保存当前块作为下一次的“过去”
+            idx = 0;
+            p_dat = iio_buffer_first(rxbuf, rx0_i);
+            for (; p_dat < p_end; p_dat += p_inc, idx++) {
+                prev_i[idx] = ((int16_t*)p_dat)[0];
+                prev_q[idx] = ((int16_t*)p_dat)[1];
+            }
         }
     }
 
     free(snap_i);
     free(snap_q);
+    free(prev_i);
+    free(prev_q);
     iio_buffer_destroy(rxbuf);
     iio_channel_disable(rx0_i);
     iio_channel_disable(rx0_q);
