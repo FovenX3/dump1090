@@ -61,14 +61,14 @@ void analyze_packet(int16_t *i_data, int16_t *q_data, int total_samples, double 
         mag[i] = sqrt(di * di + dq * dq);
     }
 
-    // 2. 指数滑动平均滤波 (替代 Python 的 filtfilt)
-    double alpha = 0.2; // 平滑系数
+    // 2. 指数滑动平均滤波 (平滑毛刺)
+    double alpha = 0.2; 
     double smoothed = mag[0];
     double peak_val = 0.0;
     
     for (int i = 0; i < dec_len; i++) {
         smoothed = alpha * mag[i] + (1.0 - alpha) * smoothed;
-        mag[i] = smoothed; // 覆盖回原数组
+        mag[i] = smoothed; 
         if (smoothed > peak_val) {
             peak_val = smoothed;
         }
@@ -102,35 +102,93 @@ void analyze_packet(int16_t *i_data, int16_t *q_data, int total_samples, double 
     pulses[pulse_cnt].duration = duration;
     pulse_cnt++;
 
-    // 5. 寻找同步停顿 (Sync Gap > 300 点)
-    int sync_idx = -1;
-    for (int i = 0; i < pulse_cnt; i++) {
-        if (pulses[i].state == 'L' && pulses[i].duration > 300) {
-            sync_idx = i;
-            break;
+    // 剥除头尾的低电平静默期
+    int start_idx = 0;
+    while (start_idx < pulse_cnt && pulses[start_idx].state == 'L') start_idx++;
+    int end_idx = pulse_cnt - 1;
+    while (end_idx >= 0 && pulses[end_idx].state == 'L') end_idx--;
+
+    // 过滤掉极短的环境噪音毛刺 (小于 20 个采样点)
+    Pulse *clean_pulses = (Pulse *)malloc((end_idx - start_idx + 1) * sizeof(Pulse));
+    int clean_cnt = 0;
+    for (int i = start_idx; i <= end_idx; i++) {
+        if (pulses[i].duration > 20) {
+            clean_pulses[clean_cnt++] = pulses[i];
         }
     }
 
-    if (sync_idx != -1 && sync_idx + 1 < pulse_cnt) {
-        printf("\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n");
-        printf("📸 [快照成功] 截获完整无损射频包！\n");
-        printf(" 🎯 定位同步停顿: L%d\n", pulses[sync_idx].duration);
+    if (clean_cnt < 30) {
+        free(clean_pulses);
+        free(mag);
+        free(binary);
+        free(pulses);
+        return; 
+    }
 
+    printf("\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n");
+    printf("📸 [快照成功] 截获射频包，正在进行分析...\n");
+    printf("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n");
+
+    // ========================================================
+    // 新增：强制输出所有接收到的底层脉宽元数据
+    // ========================================================
+    printf(" 📊 【底层脉宽元数据 (Raw Data)】:\n   ");
+    for (int i = 0; i < clean_cnt; i++) {
+        printf("%c%d ", clean_pulses[i].state, clean_pulses[i].duration);
+        // 每 8 个脉冲换行，保持队形整齐
+        if ((i + 1) % 8 == 0) {
+            printf("\n   ");
+        }
+    }
+    printf("\n----------------------------------------------------------\n");
+
+    // ========================================================
+    // 自动指纹锚定逻辑 (寻找 H93 L150)
+    // ========================================================
+    int sync_idx = -1;
+    int streak = 0;
+    
+    for (int i = 0; i < clean_cnt - 1; i++) {
+        char state1 = clean_pulses[i].state;
+        int d1 = clean_pulses[i].duration;
+        char state2 = clean_pulses[i+1].state;
+        int d2 = clean_pulses[i+1].duration;
+        
+        if (state1 == 'H' && state2 == 'L') {
+            // 设定容差范围：H 在 70~110 之间，L 在 130~175 之间
+            if (d1 >= 70 && d1 <= 110 && d2 >= 130 && d2 <= 175) {
+                streak++;
+            } else {
+                // 匹配中断！检查是不是遇到了我们要找的同步停顿 (> 200)
+                if (streak >= 4 && d2 > 200) {
+                    sync_idx = i + 1;
+                    break;
+                }
+                // 否则重新计数
+                streak = 0;
+            }
+        }
+    }
+
+    if (sync_idx != -1 && sync_idx + 1 < clean_cnt) {
+        printf(" 🎯 特征匹配成功！在连续 %d 次前导握手后，锁定同步间隙: L%d\n", streak, clean_pulses[sync_idx].duration);
+        
         char bits[2048];
         int bit_idx = 0;
-
-        for (int i = sync_idx + 1; i < pulse_cnt; i++) {
-            if (pulses[i].state == 'H') {
-                if (pulses[i].duration > 75) {
+        
+        // 解析 PWM 比特流
+        for (int i = sync_idx + 1; i < clean_cnt; i++) {
+            if (clean_pulses[i].state == 'H') {
+                if (clean_pulses[i].duration > 75) {
                     bits[bit_idx++] = '1';
-                } else if (pulses[i].duration > 30) {
+                } else if (clean_pulses[i].duration > 30) {
                     bits[bit_idx++] = '0';
                 }
             }
         }
         bits[bit_idx] = '\0';
-
-        if (bit_idx > 10) {
+        
+        if (bit_idx > 0) {
             printf(" 💾 有效 Payload 长度 : %d Bits\n", bit_idx);
             printf(" 🔢 二进制流 : ");
             for(int i=0; i<bit_idx; i++) {
@@ -140,9 +198,12 @@ void analyze_packet(int16_t *i_data, int16_t *q_data, int total_samples, double 
             printf("\n");
             print_hex(bits, bit_idx);
         }
-        printf("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n");
+    } else {
+        printf("\n ⚠️ 警告: 自动解码失败！未能从上方元数据中匹配到标准前导码或同步间隙。\n");
     }
+    printf("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n");
 
+    free(clean_pulses);
     free(mag);
     free(binary);
     free(pulses);
@@ -153,7 +214,6 @@ int main(void) {
 
     printf("📡 正在初始化 PlutoSDR (本地 AXI 总线模式)...\n");
     
-    // 【关键】使用 local context，直接跑在 Pluto 内部
     struct iio_context *ctx = iio_create_local_context();
     if (!ctx) {
         fprintf(stderr, "无法创建本地 IIO 上下文！请确保程序在 PlutoSDR 内部运行。\n");
@@ -199,7 +259,6 @@ int main(void) {
     double i_leak = i_sum / calib_samples;
     double q_leak = q_sum / calib_samples;
 
-    // 计算触发阈值
     double max_noise = 0;
     iio_buffer_refill(rxbuf);
     void *p_dat = iio_buffer_first(rxbuf, rx0_i);
@@ -214,9 +273,8 @@ int main(void) {
     double trigger_level = max_noise * 3.5;
 
     printf("✅ 校准完成! 泄漏向量 I:%.1f Q:%.1f | 触发门限: %.1f\n", i_leak, q_leak, trigger_level);
-    printf(">>> 🚀 触发式快照雷达已启动！请按下车钥匙... (按 Ctrl+C 退出) <<<\n");
+    printf(">>> 🚀 触发式快照雷达已启动！请随时按下车钥匙... (按 Ctrl+C 退出) <<<\n");
 
-    // 分配大内存用于存储快照 (1秒的数据 = 1,000,000 个 I 和 Q)
     int total_snap_samples = CHUNK_SIZE * SNAPSHOT_CHUNKS;
     int16_t *snap_i = (int16_t *)malloc(total_snap_samples * sizeof(int16_t));
     int16_t *snap_q = (int16_t *)malloc(total_snap_samples * sizeof(int16_t));
@@ -224,7 +282,6 @@ int main(void) {
     while (!stop) {
         iio_buffer_refill(rxbuf);
         
-        // 探路：检查前 5000 个点是否有峰值
         int triggered = 0;
         int check_cnt = 0;
         p_dat = iio_buffer_first(rxbuf, rx0_i);
@@ -241,7 +298,6 @@ int main(void) {
             printf("\n⚡ 检测到射频爆发！正在锁定快门...\n");
             int offset = 0;
             
-            // 存入当前触发块
             p_dat = iio_buffer_first(rxbuf, rx0_i);
             for (; p_dat < p_end; p_dat += p_inc) {
                 snap_i[offset] = ((int16_t*)p_dat)[0];
@@ -249,7 +305,6 @@ int main(void) {
                 offset++;
             }
 
-            // 抓取后续块
             for (int chunk = 1; chunk < SNAPSHOT_CHUNKS; chunk++) {
                 iio_buffer_refill(rxbuf);
                 p_dat = iio_buffer_first(rxbuf, rx0_i);
@@ -260,10 +315,9 @@ int main(void) {
                 }
             }
 
-            printf("⚙️ 快照已生成，正在离线高精度解码...\n");
             analyze_packet(snap_i, snap_q, total_snap_samples, i_leak, q_leak);
             
-            // 清理硬件缓存
+            // 清理堆积在底层的硬件缓存，防止连续触发
             for (int k=0; k<3; k++) iio_buffer_refill(rxbuf);
             printf(">>> 继续监听... <<<\n");
         }
